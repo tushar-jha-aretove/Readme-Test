@@ -1,308 +1,378 @@
-# Paazl — Knowledge Transfer (KT) Document
+# Payment Flows – Code Map & Behaviour
 
-This document helps anyone new to the project understand **Paazl**: what it is, how it’s used, where it lives in the codebase, and how to work with it. Use it for onboarding, debugging, or making changes.
-
----
-
-## 1. What is Paazl?
-
-**Paazl** is a **shipping and delivery provider** integrated into the PWA. It lets customers:
-
-- Choose **delivery options** (e.g. home delivery with time windows, carrier, price).
-- Choose **pickup locations** (PUDO — Pick Up Drop Off) when available.
-
-The integration uses:
-
-| Component | Role |
-|-----------|------|
-| **Paazl REST API** (external) | Token, checkout state, shipping options, pickup locations |
-| **BFF** (PWA `src/api` + overrides) | Proxies and orchestrates calls to Paazl and SFCC |
-| **Paazl Checkout Widget** (JavaScript) | Third-party UI: Delivery/Pickup tabs, option selection, pickup point selection |
-| **SFCC / Commerce API** | Shipping method `paazl_{CURRENCY}`, basket/shipment custom attributes |
+This document describes **where** and **why** each payment flow works the way it does, with direct references to the codebase.
 
 ---
 
-## 2. Why We Use Paazl
+## Table of contents
 
-- **Multi-carrier and PUDO**: One integration for multiple carriers and pickup networks.
-- **Country-specific**: Enabled per site/country via SFCC site preferences.
-- **Consistent UX**: Same widget and flow across sites that have Paazl enabled.
-
----
-
-## 3. Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  PWA Frontend (React)                                                        │
-│  • Cart: country from locale/URL (or optional selector), default shipping, │
-│    refresh Paazl on cart change                                              │
-│  • Checkout: Paazl widget (Delivery/Pickup), "Save and continue"            │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  BFF (Node)                                                                  │
-│  • src/api: GET .../shipping-methods/default, GET .../paazl/delivery-info   │
-│  • overrides/app/api/paazl: paazl-config, paazl-token, paazl-options,       │
-│    paazl-checkout, shipping-options, pickup-locations                      │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-            ┌───────────────────────┼───────────────────────┐
-            ▼                       ▼                       ▼
-┌───────────────────┐   ┌─────────────────────┐   ┌─────────────────────────┐
-│  Commerce API     │   │  Paazl API           │   │  SCAPI                  │
-│  (SFCC)           │   │  (external)          │   │  Site custom preferences │
-│  Basket, shipment │   │  Token, checkout,   │   │  Paazl group:            │
-│  c_paazlAPIToken  │   │  shippingoptions,   │   │  paazlEnabled,           │
-│  c_paazlDelivery  │   │  pickuplocations    │   │  paazlWidgetEndpoint,    │
-│  Info             │   │                     │   │  paazlDefaultShipping…   │
-└───────────────────┘   └─────────────────────┘   └─────────────────────────┘
-```
-
-- **Cart flows** (default shipping, refresh delivery info) use **src/api** (ShippingMethodsService, PaazlService, PaazlDeliveryInfoService).
-- **Checkout flow** (widget config, token, tabs, submit) uses **overrides** Paazl API handlers.
+1. [Overview: payment types and entry points](#1-overview-payment-types-and-entry-points)
+2. [Backend API routes (Adyen)](#2-backend-api-routes-adyen)
+3. [Order ID behaviour: PayPal vs others](#3-order-id-behaviour-paypal-vs-others)
+4. [Flow A: Normal checkout (card, PayPal, Apple Pay in Drop-in)](#4-flow-a-normal-checkout)
+5. [Flow B: PayPal Express (from cart)](#5-flow-b-paypal-express-from-cart)
+6. [Flow C: Apple Pay Express (from cart)](#6-flow-c-apple-pay-express-from-cart)
+7. [Flow D: Paystack (South Africa)](#7-flow-d-paystack-south-africa)
+8. [Flow E: Gift card only](#8-flow-e-gift-card-only)
+9. [Flow F: Redirects and payment details](#9-flow-f-redirects-and-payment-details)
+10. [Quick reference: file → responsibility](#10-quick-reference-file--responsibility)
 
 ---
 
-## 4. Key Concepts
+## 1. Overview: payment types and entry points
 
-### 4.1 Paazl checkout token
+| Flow | Where it starts | Order created when? | Main backend | Thank-you |
+|------|-----------------|----------------------|--------------|-----------|
+| **Normal checkout** | Checkout → Payment step | **Before** first Adyen call (`createOrder(basketId)`) | `POST /api/adyen/payments` (else branch) | Drop-in `onPaymentCompleted` → `/checkout/confirmation/:orderNo` |
+| **PayPal Express** | Cart (express buttons) | **After** first Adyen call: order number first, then `createOrder()` in payment-details | `POST /api/adyen/payments` (PayPal branch) then `POST /api/adyen/payments/details` | `handleAdditionalDetails` → `navigateToThankYouPage(merchantReference)` |
+| **Apple Pay Express** | Cart (express buttons) | **Before** Adyen call (`createOrder(basketId)` in payments) | `POST /api/adyen/payments` (else branch) | `processPaymentCompleted` → `navigateToThankYouPage(orderNo)` |
+| **Paystack** | Checkout → Place order | On Place order: `createOrder(basketId)` then Paystack | Checkout `createOrder` + Paystack | `onSuccess` → thank-you |
+| **Gift card only** | Checkout → Place order | `POST /api/orders` (no Adyen) | Orders API | `navigateToThankYouPage(orderNo)` |
 
-- Obtained from Paazl: `POST {PAAZL_URL}/checkout/token` with `{ reference: basketId }`.
-- Tied to a basket; used for all Paazl calls for that basket.
-- We store it on the basket as **`c_paazlAPIToken`** so we can reuse it (e.g. when cart items change).
-
-### 4.2 Delivery info
-
-- JSON string describing the selected option: carrier, cost, identifier, name, delivery dates; for pickup, also pickup location (name, address, opening times, code).
-- We store it on the **shipment** as **`c_paazlDeliveryInfo`** (string).
-- Used to show the chosen method in cart/checkout summary and for order processing.
-
-### 4.3 Shipping method ID
-
-- In SFCC, Paazl is represented as a shipping method with ID **`paazl_{CURRENCY}`** (e.g. `paazl_EUR`, `paazl_GBP`).
-- This ID is set on the shipment when the user has a Paazl option selected.
-
-### 4.4 Country / locale (cart)
-
-- **Default:** The shipping country used for default shipping and Paazl is **not** from a dropdown. It is derived from the **locale/URL** via **useExtendedMultiSite()** — the site’s default country for the current locale (e.g. `/uk-en` → UK). See `use-extended-multi-site.js` (countryCode from `site.l10n.defaultCountry`).
-- **Optional:** If cart content has **countrySelector.enabled** (Contentstack), a **country selector** is shown in the order summary; the user can change country and that value is used (and stored in localStorage). Logic: **useCountryCode** returns `defaultCountry` (from locale) when selector is disabled, or the dropdown value when enabled.
-
-### 4.5 Paazl preferences (SFCC)
-
-- Stored in **Site Custom Preferences**, group **`Paazl`** (see `CUSTOM_PREFERENCES_SCOPE.PAAZL` in `src/api/utils/constants.ts`).
-- Examples: `paazlEnabled`, `paazlWidgetEndpoint`, `paazlDefaultShippingOption` (JSON per country: `postalCode`, `shippingOptionIdentifier`), widget tabs/style/limits.
+**Important:**  
+- **PayPal Express** is the only flow that needs an **order number before the order exists** (reserved first, order created later in payment-details).  
+- **Normal checkout** and **Apple Pay Express** create the **real order from the basket first**, then use that `orderNo` in the payment request.
 
 ---
 
-## 5. End-to-End Flows
+## 2. Backend API routes (Adyen)
 
-### 5.1 Flow 1: Cart — Default shipping by country (from locale/URL or optional selector)
+All Adyen-related routes are registered in:
 
-**Goal:** Use the current shipping country to set default shipping method; if Paazl is enabled for that country, get a default Paazl option and store token + delivery info.
+**File:** `overrides/app/adyen/api/routes/index.js`
 
-**Where country comes from:** By default, **country is derived from the locale/URL** (via `useExtendedMultiSite()` — site’s default country for the current locale). There is **no** country selector in that case. When cart content has **country selector enabled** (`countrySelector.enabled` from Contentstack), a dropdown is shown and the user can change country; that value is then used (and stored in localStorage).
+| Method | Path | Controller | Purpose |
+|--------|------|------------|---------|
+| GET | `/api/adyen/environment` | EnvironmentController | Client key, environment (used by all Adyen UIs) |
+| GET | `/api/adyen/paymentMethods` | PaymentMethodsController | Available methods (card, PayPal, Apple Pay, etc.); can be called with `location=checkout` or `location=cart` |
+| POST | `/api/adyen/payments` | PaymentsController | First payment call: create/reserve order, call Adyen Payments API |
+| POST | `/api/adyen/payments/details` | PaymentsDetailsController | Follow-up after redirect or 3DS; for PayPal Express also runs `createOrder()` |
+| POST | `/api/adyen/paypal/order` | PaypalOrderController | PayPal Express only: update PayPal order (shipping, address) via SFCC `updatesOrderForPaypalExpressCheckout` |
+| POST | `/api/adyen/shipping-methods` | ShippingMethodsController | Get/update shipping methods (used by express flows) |
+| POST | `/api/adyen/shipping-address` | ShippingAddressController | Update shipping address (used by express) |
 
-1. On cart load (or when user changes country in the optional selector), **selectedCountryCode** is set: either from **useExtendedMultiSite()** (locale/URL) or from the dropdown.
-2. Frontend calls **`GET /api/basket/:basketId/shipping-methods/default?siteId=...&locale=...&countryCode=...`** (with Bearer token), where **countryCode** = selectedCountryCode.
-3. BFF (`sfcc.controller.ts` → `ShippingMethodsService.getDefaultShippingInfo()`):
-   - Gets/updates basket shipping address to match country.
-   - Gets shipping methods; reads Paazl preferences for site + country.
-   - If `paazlEnabled` and `postalCode` are set: calls `PaazlService.getDefaultDeliveryInfo()` (token + shipping options), picks default by `shippingOptionIdentifier` or first option.
-   - Returns either `{ type: 'paazl', shippingMethod, paazl: { checkoutToken, deliveryInfo } }` or `{ type: 'standard', shippingMethod }`.
-4. Frontend applies result:
-   - If Paazl: **updateBasket** with `c_paazlAPIToken`, **updateShipmentForBasket** with `shippingMethod.id` and `c_paazlDeliveryInfo`.
+**Checkout redirect/confirmation (render only):**
 
-**Key files:**  
-`overrides/app/pages/cart/partials/cart-country-selector.tsx`, `overrides/app/hooks/use-select-default-shipping-method.ts`, `src/api/modules/sfcc/sfcc.controller.ts`, `src/api/modules/sfcc/shipping-methods.service.ts`, `src/api/modules/paazl/paazl.service.ts`, `src/api/modules/paazl/paazl.api.service.ts`.
-
----
-
-### 5.2 Flow 2: Cart — Basket already has Paazl; items change
-
-**Goal:** Keep Paazl delivery info in sync when the user adds/removes items or changes quantity.
-
-1. Cart page has a **useEffect** that runs when `basket?.productTotal` (or equivalent) changes.
-2. If current shipping method is Paazl (`id.startsWith('paazl_')` — see `overrides/app/utils/shipping-utils.ts`: `isPaazlShippingMethod`) and a country is selected, frontend calls **`GET /api/basket/:basketId/paazl/delivery-info?siteId=...&locale=...&countryCode=...`**.
-3. BFF (`PaazlDeliveryInfoService.getPaazlDeliveryInfo()`):
-   - Requires basket to have `c_paazlAPIToken`.
-   - Uses preferences; if Paazl enabled and postal code set, calls `PaazlService.getDefaultDeliveryInfo()` with existing token.
-   - Returns new `deliveryInfo` string.
-4. Frontend updates shipment with **`c_paazlDeliveryInfo`** via Commerce API.
-
-**Key files:**  
-`overrides/app/pages/cart/index.jsx` (useEffect), `overrides/app/hooks/use-update-paazl-delivery-info.ts`, `src/api/modules/sfcc/paazl-delivery-info.service.ts`, `src/api/modules/paazl/paazl.service.ts`.
+- `*/checkout/redirect` – where user lands after PayPal/3DS redirect; `redirectResult` in query.
+- `*/checkout/confirmation/:orderNo` – thank-you page for normal/Apple Pay flow.
 
 ---
 
-### 5.3 Flow 3: Checkout — Shipping step and Paazl widget
+## 3. Order ID behaviour: PayPal vs others
 
-**Goal:** Show Paazl widget on shipping step; when user clicks “Save and continue”, read selection from Paazl and save to basket.
+### PayPal Express: order number **before** order exists
 
-**3a. Load config and token**
+1. **First request** (`POST /api/adyen/payments` with `paymentMethod.type === 'paypal'` and `subtype === 'express'`):
+   - **File:** `overrides/app/adyen/api/controllers/payments.js` (around 347–356).
+   - Calls **`customApiClient.createOrderNumber()`** (Custom API: generate and assign order number to basket).
+   - Sends to Adyen: `reference: generatedOrderNo.orderNo`.
+   - **No** `shopperOrdersService.createOrder(basketId)` here.
+2. **Later** (when user returns from PayPal and payment details are submitted):
+   - **File:** `overrides/app/adyen/api/controllers/payments-details.js` (around 27–31).
+   - If `paymentType === 'paypalexpress'`: calls **`customApiClient.createOrder()`** to create the actual order (using the already-generated order number).
+   - Then calls Adyen `paymentsDetails` and updates order (payment method, PSP reference, etc.).
 
-- Checkout context uses **`usePaazlConfig(basket)`**.
-- Frontend calls **`GET /api/paazl-config?basketId=...&siteId=...`**.
-- BFF (overrides): gets SCAPI admin token; in parallel fetches SFCC site Paazl preferences and Paazl token (`POST .../checkout/token`). Returns merged config (e.g. `paazlWidgetEndpoint`, `paazlEnabled`, widget tabs/style/limits) + token.
-- Frontend derives **isPaazlAvailable** (e.g. `paazlEnabled` and current country in `paazlDefaultShippingOption`). If true, shipping step renders **PaazlShippingOptions** (and thus the widget).
+**Custom API (order number vs order create):**
 
-**3b. Widget mount and init**
+- **File:** `overrides/app/adyen/api/controllers/custom-api.js`
+  - `createOrderNumber()` (lines 83–94): only generates/reserves an order number (e.g. custom SFCC endpoint `order-generate`).
+  - `createOrder()` (lines 105–115): creates the order (e.g. custom SFCC endpoint `order-create`) using that number.
 
-- **PaazlShippingOptions** renders **PaazlWidget** with basket, config, widget endpoint.
-- **PaazlWidget** (`overrides/app/components/paazl-widget/index.jsx`):
-  - Uses **usePaazlToken(basket)** → `GET /api/paazl-token?basketId=...` for token.
-  - Uses **usePaazlOptionsConfig(basket, paazlToken)** → `GET /api/paazl-options?postalCode=...&countryCode=...&paazlToken=...` to get **availableTabs** (DELIVERY, PICKUP).
-  - Loads script from `paazlWidgetEndpoint`, then calls **`window.PaazlCheckout.init(...)`** with token, address, shipment parameters, config, mount element `#paazl-checkout`.
-- Paazl’s script renders Delivery/Pickup UI inside `#paazl-checkout`. We only provide the “Save and continue” button; all option/pickup selection is inside the widget.
+### Apple Pay & normal checkout: order **before** payment
 
-**3c. User clicks “Save and continue”**
+1. **Single request** (`POST /api/adyen/payments`, **else** branch – not PayPal Express):
+   - **File:** `overrides/app/adyen/api/controllers/payments.js` (around 408–416).
+   - Calls **`shopperOrdersService.createOrder(req.headers.basketid)`** → real order is created.
+   - Payment request uses `reference: order.orderNo` (around 474).
+   - No `createOrderNumber()` or delayed `createOrder()`.
 
-- **PaazlShippingOptions** `handleSubmit`:
-  1. Calls **`GET /api/paazl-checkout?basketId=...&currencyCode=...`**.
-  2. BFF (overrides) calls Paazl **`GET {PAAZL_URL}/checkout?reference=basketId`**, then **parseResponse** to build delivery info (ID, carrier, cost, identifier, name, deliveryDates; for pickup, pickupLocation with name, address, openingTimes, code).
-  3. Frontend receives delivery info and calls **onSubmit({ shippingMethodId: deliveryInfo.ID, c_paazlDeliveryInfo: JSON.stringify(deliveryInfo) })**.
-  4. Shipping step **updateShipmentForBasket** with `shippingMethod: { id }` and `c_paazlDeliveryInfo`, then continues to next step.
-
-**Key files:**  
-`overrides/app/pages/checkout/context/checkout-context.tsx`, `overrides/app/pages/checkout/partials/shipping-options/shipping-options-step.jsx`, `paazl-shipping-options.jsx`, `overrides/app/components/paazl-widget/index.jsx`, `overrides/app/hooks/use-paazl-config.jsx`, `use-paazl-token.jsx`, `use-paazl-options-config.jsx`, `overrides/app/api/paazl/*` (paazl-config.js, paazl-token.js, paazl-tabs-config.js, paazl-checkout.js, helper.js).
-
----
-
-## 6. Code Map — Where to Find What
-
-### 6.1 Frontend (overrides)
-
-| Area | Path | Purpose |
-|------|------|---------|
-| Country source | `overrides/app/hooks/use-country-code.ts`, `use-extended-multi-site.js` | selectedCountryCode: from locale/URL when selector disabled, from dropdown when enabled |
-| Optional country selector | `overrides/app/pages/cart/partials/cart-country-selector.tsx` | Shown only when countrySelector.enabled in cart content; country change → default shipping |
-| Cart context | `overrides/app/pages/cart/context/cart-provider.js` | selectedCountryCode, setSelectedCountryCode, updatePaazlDeliveryInfo, isBasketUpdatingForPaazl |
-| Default shipping hook | `overrides/app/hooks/use-select-default-shipping-method.ts` | Calls default shipping API, applies Paazl token + delivery info to basket/shipment |
-| Paazl refresh hook | `overrides/app/hooks/use-update-paazl-delivery-info.ts` | Calls paazl/delivery-info, updates shipment c_paazlDeliveryInfo |
-| Cart trigger | `overrides/app/pages/cart/index.jsx` | useEffect on basket.productTotal to refresh Paazl when items change |
-| Shipping utils | `overrides/app/utils/shipping-utils.ts` | `isPaazlShippingMethod(id)` |
-| Checkout context | `overrides/app/pages/checkout/context/checkout-context.tsx` | usePaazlConfig(basket) |
-| Shipping step | `overrides/app/pages/checkout/partials/shipping-options/shipping-options-step.jsx` | isPaazlAvailable, onSubmit (updateShipment), summary label |
-| Paazl vs standard | `overrides/app/pages/checkout/partials/shipping-options/shipping-options.jsx` | Renders PaazlShippingOptions or standard options |
-| Paazl shipping UI | `overrides/app/pages/checkout/partials/shipping-options/paazl-shipping-options.jsx` | Widget + “Save and continue”, getPaazlDeliveryInfo, onSubmit |
-| Paazl widget | `overrides/app/components/paazl-widget/index.jsx` | Script load, PaazlCheckout.init, #paazl-checkout, styles |
-| Widget helper | `overrides/app/components/paazl-widget/helper.js` | getShipmentParameters(basket) |
-| Paazl hooks | `overrides/app/hooks/use-paazl-config.jsx`, `use-paazl-token.jsx`, `use-paazl-options-config.jsx` | Config, token, available tabs |
-
-### 6.2 BFF — src/api (Cart flows)
-
-| Area | Path | Purpose |
-|------|------|---------|
-| Routes | `src/api/modules/sfcc/sfcc.controller.ts` | GET .../shipping-methods/default, GET .../paazl/delivery-info |
-| Default shipping logic | `src/api/modules/sfcc/shipping-methods.service.ts` | getDefaultShippingInfo, Paazl vs standard, getPaazlShippingMethodId |
-| Paazl preferences | `src/api/modules/sfcc/paazl-preferences.service.ts` | getPreferences(siteId, countryCode) from SCAPI Paazl group |
-| Paazl delivery info | `src/api/modules/sfcc/paazl-delivery-info.service.ts` | getPaazlDeliveryInfo (uses basket token + PaazlService) |
-| Paazl business logic | `src/api/modules/paazl/paazl.service.ts` | getDefaultDeliveryInfo, getShipmentParameters, getShippingOptionDeliveryInfo |
-| Paazl API client | `src/api/modules/paazl/paazl.api.service.ts` | getCheckoutToken, getCheckout, getShippingOptions (axios, PAAZL_URL, Bearer auth) |
-| Constants | `src/api/utils/constants.ts` | CUSTOM_PREFERENCES_SCOPE.PAAZL = 'Paazl' |
-
-### 6.3 BFF — overrides (Checkout flows)
-
-| Area | Path | Purpose |
-|------|------|---------|
-| Paazl routes | `overrides/app/api/paazl/index.js` | registerPaazlEndpoints: paazl-config, paazl-checkout, paazl-options, paazl-token |
-| Config | `overrides/app/api/paazl/paazl-config.js` | handlePaazlConfigRequest, fetchPaazlConfig (SCAPI), fetchPaazlToken |
-| Token | `overrides/app/api/paazl/paazl-token.js` | handlePaazlTokenRequest, POST .../checkout/token |
-| Tabs | `overrides/app/api/paazl/paazl-tabs-config.js` | handlePaazlOptionsConfigRequest, shippingoptions + pickuplocations → availableTabs |
-| Checkout (submit) | `overrides/app/api/paazl/paazl-checkout.js` | handlePaazlCheckoutRequest, GET Paazl /checkout, parseResponse |
-| Helpers | `overrides/app/api/paazl/helper.js` | filterData (config keys), parseResponse, formatShippingAddress, getShippingMethodID |
-| Shipping options | `overrides/app/api/paazl/shipping-options.js` | POST .../shippingoptions (used from paazl-tabs-config) |
-| Pickup locations | `overrides/app/api/paazl/pickup-locations.js` | POST .../pickuplocations (used from paazl-tabs-config) |
+So: **PayPal Express = order number first, order created later in payment-details.**  
+**Apple Pay / normal = order created first, then its ID used in payment.**
 
 ---
 
-## 7. Configuration
+## 4. Flow A: Normal checkout
 
-### 7.1 Environment variables
+User goes through: **Shipping address → Shipping options → Payment → Place order.**
 
-Set in `.env` (see `.env.example`):
+### 4.1 Checkout steps and state
 
-| Variable | Purpose |
-|----------|---------|
-| `PAAZL_URL` | Paazl API base URL (e.g. `https://api-acc.paazl.com/v1`) |
-| `PAAZL_API_KEY` | Paazl API key |
-| `PAAZL_API_SECRET` | Paazl API secret |
+- **File:** `overrides/app/pages/checkout/context/checkout-context.tsx`
+  - Steps: `SHIPPING_ADDRESS`, `SHIPPING_OPTIONS`, `PAYMENT`, `REVIEW_ORDER` (see `CHECKOUT_STEPS_LIST`).
+  - Step index and `goToStep` drive which partial is shown.
 
-Auth header used in `paazl.api.service.ts` and overrides: `Bearer ${PAAZL_API_KEY}:${PAAZL_API_SECRET}`.
+### 4.2 Where the payment step is rendered
 
-### 7.2 SFCC site custom preferences (Paazl group)
+- **File:** `overrides/app/pages/checkout/index.jsx`
+  - Renders `ShippingAddressStep`, `ShippingOptionsStep`, and **`Payment`** based on `step`.
+- **File:** `overrides/app/pages/checkout/partials/payment.jsx`
+  - If `paymentProvider === PAYMENT_PROVIDERS.ADYEN`: wraps content in `AdyenCheckoutProvider` and renders **`AdyenPayment`** (around 282–299).
+  - If Paystack: renders `PaystackPayment`.
 
-- **paazlEnabled** — Whether Paazl is on for the site.
-- **paazlDefaultShippingOption** — JSON per countryCode: `{ postalCode, shippingOptionIdentifier }` (used for default option on cart).
-- **paazlWidgetEndpoint** — URL of Paazl Checkout Widget script.
-- **paazlWidgetDeliveryRangeFormat**, **paazlWidgetAvailableTabs**, **paazlWidgetDefaultTabs**, **paazlWidgetPredefinedStyle**, **paazlWidgetShippingOptionsLimit**, **paazlWidgetPickupLocationsPageLimit**, **paazlWidgetPickupLocationsLimit** — Widget behaviour and styling.
+### 4.3 Adyen payment component (Drop-in)
 
----
+- **File:** `overrides/app/pages/checkout/partials/adyen-payment.jsx`
+  - Renders gift card block (if applicable) and **`AdyenCheckout`** with basket, handlers, etc.
+- **File:** `overrides/app/adyen/components/adyenCheckout.jsx`
+  - Uses **Adyen Drop-in** with: Card, Klarna, Swish, **ApplePay**, **PayPal**, Bancontact, BcmcMobile, Blik (lines 69–77).
+  - On load: `handleQueryParams` → if no `redirectResult`/`amazonCheckoutSessionId`/`adyenAction`, creates **`new Dropin(checkout, { paymentMethodComponents: [...], paymentMethodsConfiguration, ... })`** and mounts it (lines 64–86).
+  - `paymentMethodsConfiguration` comes from **`overrides/app/adyen/components/paymentMethodsConfiguration.js`** (card, paypal, applepay, klarna, giftcard, etc.).
 
-## 8. Data Stored on Basket / Shipment
+### 4.4 Where the first payment request is sent (normal flow)
 
-| Location | Attribute | Type | Description |
-|----------|-----------|------|-------------|
-| Basket | `c_paazlAPIToken` | string | Paazl checkout token for this basket |
-| Shipment | `shippingMethod.id` | string | e.g. `paazl_EUR` when Paazl is selected |
-| Shipment | `c_paazlDeliveryInfo` | string | JSON string of selected option (carrier, cost, identifier, name, deliveryDates; for pickup, pickupLocation) |
+- Drop-in’s **onSubmit** is wired via config from `getPaymentMethodsConfiguration` in **`overrides/app/adyen/contexts/adyen-checkout-context.jsx`** (e.g. around 77–95).
+- Base submit behaviour is in **`overrides/app/adyen/components/helpers/baseConfig.js`**:
+  - **`onSubmit`** (lines 34–66): calls **`AdyenPaymentsService.submitPayment(state.data, basketId, customerId, locale)`**.
+- **File:** `overrides/app/adyen/services/payments.js`
+  - `submitPayment` → **POST `/api/adyen/payments`** with `data`, headers `basketid`, `customerid`, query `locale` (and site from API client).
 
-These custom attributes must exist in your SFCC basket/shipment type definitions.
+### 4.5 What the backend does (normal flow, not PayPal Express)
 
----
+- **File:** `overrides/app/adyen/api/controllers/payments.js`
+  - Validates request, gets basket (around 276–316).
+  - If no Adyen payment instrument in basket, adds one (around 318–334).
+  - **Not** PayPal Express → goes to **else** (around 408+):
+    - **`order = await shopperOrdersService.createOrder(req.headers.basketid)`** (line 416).
+    - Builds `paymentRequest` with `reference: order.orderNo`, amounts, addresses from **order** (around 467–493).
+    - Calls **Adyen** `PaymentsApi.payments(paymentRequest)`.
+    - On success: updates order (payment method, PSP ref) via **OrderApiClient** (around 528–537).
+    - Gift card: may call `redeemStrategy.redeemLater(order.orderNo)` (around 545–550).
+  - Response is shaped by **`createCheckoutResponse`** (e.g. `overrides/app/adyen/utils/createCheckoutResponse.js`).
 
-## 9. API Reference (Quick)
+### 4.6 Response handling and thank-you (normal flow)
 
-### 9.1 Our BFF APIs (used by frontend)
+- **baseConfig.js** `onSubmit`: after `submitPayment` returns, **`props?.setOrderNo?.(paymentsResponse.merchantReference)`** (line 62); then `actions.resolve(paymentsResponse)`.
+- **adyenCheckout.jsx**: in checkout config, **`onPaymentCompleted: (result, component) => { props?.onPaymentCompleted?.(); legacyNavigator.navigateToThankYouPage(getOrderNo()) }`** (around 153–156).
+- Thank-you URL: **`/checkout/thankyou?orderNo=...`** (see **`overrides/app/utils/navigator.js`** `legacyUrls.getThankYouPageUrl`).
 
-| Method + path | Used in | Purpose |
-|---------------|---------|---------|
-| GET `/api/basket/:basketId/shipping-methods/default` | Cart (country change) | Default shipping; when Paazl enabled returns token + deliveryInfo |
-| GET `/api/basket/:basketId/paazl/delivery-info` | Cart (items change) | Refresh c_paazlDeliveryInfo |
-| GET `/api/paazl-config` | Checkout | Widget config + Paazl token |
-| GET `/api/paazl-token` | Checkout (widget) | Paazl token for widget init |
-| GET `/api/paazl-options` | Checkout (widget) | availableTabs (DELIVERY/PICKUP) for postal code |
-| GET `/api/paazl-checkout` | Checkout (Save and continue) | Current Paazl selection → deliveryInfo for shipment |
+### 4.7 3DS / redirect (normal flow)
 
-### 9.2 Paazl external API (used by BFF)
+- If Adyen returns a redirect (e.g. 3DS), user goes to **`/checkout/redirect?redirectResult=...`** (returnUrl in payment request, e.g. line 369 in payments.js).
+- **File:** `overrides/app/pages/checkout-redirect/checkout-redirect-page.tsx` (and route in **routes.jsx**): page loads, can pass `redirectResult` into Adyen/checkout logic.
+- **File:** `overrides/app/adyen/components/adyenCheckout.jsx`: when **`redirectResult`** is in URL params, **`checkout.submitDetails({ data: { details: { redirectResult } } })`** (lines 52–54) → that triggers a **payment-details** call and then completion/cancel handling.
 
-| Method + path | Purpose |
-|---------------|---------|
-| POST `{PAAZL_URL}/checkout/token` | Get checkout token (body: `{ reference: basketId }`) |
-| GET `{PAAZL_URL}/checkout?reference=basketId` | Get current checkout state (deliveryType, shippingOption, pickupLocation) |
-| POST `{PAAZL_URL}/shippingoptions` | Get delivery options for address |
-| POST `{PAAZL_URL}/pickuplocations` | Get pickup locations for address |
+### 4.8 Payment details (normal flow, after redirect)
 
----
+- **File:** `overrides/app/adyen/components/helpers/baseConfig.js`
+  - **`onAdditionalDetails`** (lines 67–78): calls **`AdyenPaymentsDetailsService.submitPaymentsDetails(state.data, customerId)`** (no `paymentType` set like PayPal).
+- **File:** `overrides/app/adyen/services/payments-details.js`
+  - **POST `/api/adyen/payments/details`** with `data` and `paymentType`.
+- **File:** `overrides/app/adyen/api/controllers/payments-details.js`
+  - For **non–PayPal Express** (`paymentType !== 'paypalexpress'`): **does not** call `createOrder()`; order already exists.
+  - Calls Adyen **`paymentsDetails`**, then **OrderApiClient.updateOrder(merchantReference, ...)** (around 54–60).
+  - Gift card redeem may run (around 79–87).
+  - Response goes back to frontend; Drop-in completes and can trigger thank-you.
 
-## 10. Troubleshooting
-
-- **Paazl not showing on cart/checkout**  
-  Check: (1) `paazlEnabled` and country in `paazlDefaultShippingOption` in site preferences, (2) `postalCode` set for that country for default option, (3) env `PAAZL_URL`, `PAAZL_API_KEY`, `PAAZL_API_SECRET` set and correct.
-
-- **“c_paazlAPIToken is missed in the basket”**  
-  Delivery-info refresh (cart items change) requires the basket to already have a token. Ensure Flow 1 (country change → default shipping) runs first when Paazl is enabled, or that checkout has requested a token so basket was updated.
-
-- **Widget not loading**  
-  Check `paazlWidgetEndpoint` in site preferences and that the script URL is reachable. Check browser console for script/init errors; ensure `window.PaazlCheckout` exists after script load.
-
-- **Wrong default option on cart**  
-  Check `paazlDefaultShippingOption` for the country: `shippingOptionIdentifier` must match an option returned by Paazl for that postal code.
-
-- **Submit returns 500 or empty**  
-  Ensure user has selected an option/pickup in the widget before “Save and continue”. Check BFF logs for Paazl API errors (e.g. invalid token, wrong reference).
-
----
-
-## 11. Related Documentation
-
-- **Paazl_Flow_Complete_Story.md** — Detailed user story with APIs, clicks, and code locations for each flow.
-- **PWA_Integrations_And_Features_Guide.md** — High-level integrations overview.
-- **Src_API_Complete_Reference.md** — BFF `src/api` structure and modules.
-- **Commerce_API_Usage_In_The_Project.md** — How we use Commerce API (basket, shipment).
-- SFCC-side: `sfcc-demandware/paazl_documentation/` and `sfcc-demandware/cartridges/int_paazl_core/` — SFCC cartridge and Business Manager setup (if you need backend/OCAPI context).
+**Summary normal flow:**  
+Checkout steps → Payment step → Drop-in → **onSubmit** → **POST /api/adyen/payments** → backend **createOrder(basketId)** → Adyen payments with `reference: order.orderNo` → success → **setOrderNo(merchantReference)** → **onPaymentCompleted** → thank-you. Redirect path: **redirect** page → **submitDetails(redirectResult)** → **POST /api/adyen/payments/details** (no `createOrder`) → complete.
 
 ---
 
-*Last updated to align with the codebase and Paazl_Flow_Complete_Story.md. For flow-level detail and exact code references, use Paazl_Flow_Complete_Story.md.*
+## 5. Flow B: PayPal Express (from cart)
+
+User is on **cart**; clicks **PayPal** button; address/shipping and payment happen in PayPal’s UI; then return to site and thank-you.
+
+### 5.1 Where the button is shown
+
+- **File:** `overrides/app/pages/cart/partials/cart-cta.tsx`
+  - Renders **`ExpressPaymentContainer`** (around 43).
+- **File:** `overrides/app/pages/cart/partials/cart-express-payment.tsx`
+  - Uses **`AdyenExpressCheckoutProvider`** (cart context: basket, auth, **location: CART** for payment methods).
+  - Renders **`PaypalExpress`** and **`ApplePayExpress`** (lines 54–55).
+
+### 5.2 PayPal Express UI and config
+
+- **File:** `overrides/app/adyen/components/paypal-express/paypal-express.jsx`
+  - Uses **`useAdyenExpressCheckout()`** for: `adyenEnvironment`, `adyenPaymentMethods`, `basket`, `locale`, `site`, `authToken`, `shippingMethods`.
+  - Creates **`PaypalExpressService`** with basketId, shippingMethodId, amounts, etc. (lines 55–68).
+  - **AdyenCheckout** created with `paymentMethodsResponse: adyenPaymentMethods`, **amount: basket.c_productsTotalInCents** (no order yet).
+  - **new PayPal(checkout, config)** with:
+    - **onSubmit** → `paypalService.handleSubmit`
+    - **onShippingAddressChange** → `paypalService.handleShippingAddressChange`
+    - **onShippingOptionsChange** → `paypalService.handleShippingOptionsChange`
+    - **onAuthorized** → `paypalService.handleAuthorized`
+    - **onAdditionalDetails** → `paypalService.handleAdditionalDetails`
+
+### 5.3 First payment call (PayPal Express)
+
+- **File:** `overrides/app/adyen/components/paypal-express/paypal-express-service.js`
+  - **`handleSubmit(state, component, actions)`** (lines 61–84):
+    - Calls **`AdyenPaymentsService.submitPayment(state.data, basketId, customerId, locale)`** → **POST `/api/adyen/payments`**.
+    - State includes payment method from Adyen (PayPal express); backend receives **`data.paymentMethod.type === 'paypal'`** and **`data.paymentMethod.subtype === 'express'`**.
+
+**Backend (PayPal branch):**
+
+- **File:** `overrides/app/adyen/api/controllers/payments.js` (lines 347–406)
+  - **`customApiClient.createOrderNumber()`** → only order number generated and stored (e.g. on basket).
+  - **No** `shopperOrdersService.createOrder(basketId)`.
+  - Builds **paymentRequest** with **`reference: generatedOrderNo.orderNo`**, amount from **basket** (e.g. `basket.c_productsTotalInCents`).
+  - **checkoutApi.PaymentsApi.payments(paymentRequest)** → Adyen may return redirect to PayPal.
+  - Response with `orderNo: generatedOrderNo.orderNo` (in checkoutResponse) returned to frontend.
+
+So: **order number exists; order record does not yet.**
+
+### 5.4 Updating PayPal order (address/shipping in PayPal popup)
+
+- When user changes address or shipping in PayPal UI, **onShippingAddressChange** / **onShippingOptionsChange** call **`this.#orderService.updatePayPalOrder(patch)`**.
+- **File:** `overrides/app/adyen/components/paypal-express/paypal-express-service.js` (e.g. 86–113, 118–151).
+- **File:** `overrides/app/adyen/services/paypal-order.ts`
+  - **AdyenPaypalOrderService.updatePayPalOrder(orderData)** → **POST `/api/adyen/paypal/order`** with `siteId`, body `{ data: orderData }`.
+- **File:** `overrides/app/adyen/api/controllers/paypal-order.js`
+  - Calls SFCC **`checkoutApi.UtilityApi.updatesOrderForPaypalExpressCheckout(data, ...)`** to sync PayPal’s order (amounts, shipping, address).
+
+### 5.5 After user approves in PayPal: authorized and additional details
+
+- **handleAuthorized** (paypal-express-service.js 155–181): updates **basket** shipping/billing/customer from PayPal data via **ShopperBasketsService** (no order creation).
+- When Adyen needs more details (e.g. after redirect back), **handleAdditionalDetails** (lines 183–199):
+  - **AdyenPaymentsDetailsService.submitPaymentsDetails(state.data, customerId, PAYMENT_METHOD_TYPE)** with **`paymentType: 'paypalexpress'`**.
+  - **File:** `overrides/app/adyen/services/payments-details.js`: POST **`/api/adyen/payments/details`** with `data` and **`paymentType: 'paypalexpress'`**.
+
+**Backend payment-details (PayPal Express):**
+
+- **File:** `overrides/app/adyen/api/controllers/payments-details.js` (lines 27–31)
+  - If **`paymentType == 'paypalexpress'`**: **`await customApiClient.createOrder()`** → **actual order is created** (using the reserved order number).
+  - Then **checkoutApi.PaymentsApi.paymentsDetails(data)**.
+  - **OrderApiClient.updateOrder(response.merchantReference, ...)** (lines 54–60).
+  - Gift card redeem if needed (79–87).
+  - Response (with `merchantReference`) returned.
+
+### 5.6 Thank-you (PayPal Express)
+
+- **paypal-express-service.js** **handleAdditionalDetails**: after **submitPaymentsDetails** returns, **`legacyNavigator.navigateToThankYouPage(paymentsResponse.merchantReference)`** (line 195).
+
+**Summary PayPal Express:**  
+Cart → **PayPal** button → **onSubmit** → **POST /api/adyen/payments** (PayPal branch) → **createOrderNumber()** only → Adyen with `reference: orderNo` → user in PayPal (address/shipping updates via **POST /api/adyen/paypal/order**) → **onAuthorized** (basket updated) → **onAdditionalDetails** → **POST /api/adyen/payments/details** with **paymentType: 'paypalexpress'** → **createOrder()** → Adyen paymentDetails + order update → thank-you with **merchantReference**.
+
+---
+
+## 6. Flow C: Apple Pay Express (from cart)
+
+User is on **cart**; clicks **Apple Pay**; address/shipping in Apple Pay sheet; payment; then thank-you.
+
+### 6.1 Where the button is shown
+
+- Same as PayPal: **cart-express-payment.tsx** inside **AdyenExpressCheckoutProvider**, rendering **`ApplePayExpress`** (line 55).
+
+### 6.2 Apple Pay Express UI and config
+
+- **File:** `overrides/app/adyen/components/apple-pay/apple-pay-express.jsx`
+  - **useAdyenExpressCheckout()** for environment, payment methods, basket, shipping methods.
+  - **getApplePayExpressCheckout** (apple-pay-express-checkout.js): creates Adyen Checkout instance for Apple Pay.
+  - **getApplePayExpressConfig** (apple-pay-express-config.js): returns config with:
+    - **onShippingContactSelected** → **ApplePayExpressService.processShippingContactSelected**
+    - **onShippingMethodSelected** → **ApplePayExpressService.processShippingMethodSelected**
+    - **onPaymentAuthorized** → **ApplePayExpressService.processAuthorized**
+    - **onSubmit** → **ApplePayExpressService.processSubmit**
+    - **onComplete** → **ApplePayExpressService.processPaymentCompleted**
+  - **new ApplePay(checkout, config)** mounted on container.
+
+### 6.3 Address/shipping in Apple Pay sheet
+
+- **File:** `overrides/app/adyen/components/apple-pay/apple-pay-express-service.js`
+  - **processShippingContactSelected** (59–84): validates country/postal (e.g. blocked postal codes); resolves/rejects with **newTotal**.
+  - **processShippingMethodSelected** (98–122): finds shipping method, updates basket shipment via **ShopperBasketsService**, returns new total for Apple Pay.
+
+### 6.4 Payment authorized and basket update
+
+- **processAuthorized** (133–164): maps Apple Pay **billingContact** / **shippingContact** to addresses; updates **basket** shipping and billing and customer email via **ShopperBasketsService**; **actions.resolve()** (no order creation here).
+
+### 6.5 Submit payment (first and only payment call)
+
+- **processSubmit** (170–196):
+  - **AdyenPaymentsService.submitPayment(state.data, basketId, customerId, locale)** → **POST `/api/adyen/payments`**.
+  - Request does **not** send `paymentMethod.type === 'paypal'` with `subtype === 'express'`, so backend takes the **else** branch.
+
+**Backend (else branch):**
+
+- **payments.js** (408+): **`order = await shopperOrdersService.createOrder(req.headers.basketid)`** → **order created first**.
+  - Builds paymentRequest with **`reference: order.orderNo`**, order addresses, etc.
+  - **PaymentsApi.payments(paymentRequest)**.
+  - Response includes **merchantReference** (= order.orderNo).
+
+### 6.6 Thank-you (Apple Pay Express)
+
+- **processSubmit** sets **`this.#orderNo = merchantReference`** (line 190).
+- **processPaymentCompleted** (199–201): **`legacyNavigator.navigateToThankYouPage(this.#orderNo)`**.
+
+**Summary Apple Pay Express:**  
+Cart → **Apple Pay** → contact/shipping in sheet (basket updated) → **processAuthorized** (basket again) → **processSubmit** → **POST /api/adyen/payments** (else) → **createOrder(basketId)** → Adyen with `reference: order.orderNo` → **merchantReference** returned → **processPaymentCompleted** → thank-you. **No** payment-details step in this path; **no** `createOrderNumber()` or delayed `createOrder()`.
+
+---
+
+## 7. Flow D: Paystack (South Africa)
+
+Used when **site uses Paystack** (e.g. `paulaschoice_sa` in **config/sites.js** with `payment.provider: 'paystack'`).
+
+### 7.1 Where it runs
+
+- **Checkout** → Payment step shows **PaystackPayment** (payment.jsx when `paymentProvider !== PAYMENT_PROVIDERS.ADYEN`).
+- **Place order** in **overrides/app/pages/checkout/index.jsx** (lines 195–274): if **Paystack**, then:
+  - Add/update Paystack payment instrument on basket.
+  - **createOrder({ body: { basketId } })** → order created via SLAS/Orders API (not Adyen).
+  - Initialize Paystack with **reference: order.orderNo** (line 272).
+  - **onSuccess** / **onClose** handle success/failure; success typically navigates to thank-you with **order.orderNo**.
+
+No Adyen payments or payment-details; order is created at place-order time.
+
+---
+
+## 8. Flow E: Gift card only
+
+When **order remaining is 0** (e.g. full gift card) and user places order:
+
+- **File:** `overrides/app/pages/checkout/index.jsx` (lines 275–316)
+  - **if (isNoOrderRemaining)**:
+    - **axios.post('/api/orders', { basketId }, { params: { siteId, locale }, headers: { authorization } })** (lines 308–314).
+    - **legacyNavigator.navigateToThankYouPage(response.data.orderNo)** (line 311).
+  - No Adyen; no payment step submit.
+
+---
+
+## 9. Flow F: Redirects and payment details
+
+### 9.1 Return URL and redirect page
+
+- Payment requests (payments.js) set **returnUrl** to **`${origin}/checkout/redirect`** (e.g. 369, 487).
+- Route: **`*/checkout/redirect`** (adyen api/routes/index.js 72–76) → **runtime.render** (checkout redirect page).
+- **File:** `overrides/app/pages/checkout-redirect/checkout-redirect-page.tsx`: reads **`redirectResult`** from query; can pass it into checkout/component that calls **submitDetails({ details: { redirectResult } })** so that **POST /api/adyen/payments/details** is triggered.
+
+### 9.2 When payment-details is used
+
+- **Normal flow:** After 3DS or other redirect, frontend calls **submitDetails** → **onAdditionalDetails** in baseConfig → **POST /api/adyen/payments/details** (no `paymentType` or non-express). Backend does **not** call `createOrder()`; order already exists.
+- **PayPal Express:** After user returns from PayPal, Adyen may require **additionalDetails**. Frontend calls **handleAdditionalDetails** with **paymentType: 'paypalexpress'** → **POST /api/adyen/payments/details** → backend runs **createOrder()** then **paymentsDetails** and order update.
+
+### 9.3 Confirmation/thank-you URL
+
+- **navigator.js**: **getThankYouPageUrl(orderNo)** → **`/checkout/thankyou?orderNo=${orderNo}`** (legacy URL).
+- Routes in **routes.jsx**: **`/checkout/confirmation/:orderNo`** for confirmation view (e.g. **overrides/app/pages/checkout/confirmation.jsx**).
+
+---
+
+## 10. Quick reference: file → responsibility
+
+| File | Responsibility |
+|------|----------------|
+| **overrides/app/adyen/api/controllers/payments.js** | Main payment handler: PayPal branch = createOrderNumber + Adyen; else = createOrder(basketId) + Adyen. |
+| **overrides/app/adyen/api/controllers/payments-details.js** | Payment details + for PayPal Express only: createOrder() then paymentsDetails and order update. |
+| **overrides/app/adyen/api/controllers/custom-api.js** | createOrderNumber() (reserve ID), createOrder() (create order using it). |
+| **overrides/app/adyen/api/controllers/paypal-order.js** | Proxy to SFCC updatesOrderForPaypalExpressCheckout (address/shipping in PayPal). |
+| **overrides/app/adyen/api/routes/index.js** | Registers all Adyen and checkout redirect/confirmation routes. |
+| **overrides/app/adyen/contexts/adyen-checkout-context.jsx** | Checkout payment step: env, payment methods (location CHECKOUT), getPaymentMethodsConfiguration. |
+| **overrides/app/adyen/contexts/adyen-express-checkout-context.jsx** | Cart express: env, payment methods (location CART), shipping methods for PayPal/Apple Pay. |
+| **overrides/app/adyen/components/adyenCheckout.jsx** | Drop-in mount, handleQueryParams (redirectResult, etc.), onPaymentCompleted → thank-you. |
+| **overrides/app/adyen/components/helpers/baseConfig.js** | onSubmit → submitPayment, setOrderNo; onAdditionalDetails → submitPaymentsDetails. |
+| **overrides/app/adyen/components/paymentMethodsConfiguration.js** | Per-method config (card, paypal, applepay, klarna, giftcard, …). |
+| **overrides/app/adyen/components/paypal-express/paypal-express.jsx** | Mounts PayPal component; wires handleSubmit, handleAuthorized, handleAdditionalDetails, etc. |
+| **overrides/app/adyen/components/paypal-express/paypal-express-service.js** | handleSubmit → POST payments; handleAdditionalDetails → POST payments/details (paypalexpress) → thank-you; updatePayPalOrder for address/shipping. |
+| **overrides/app/adyen/components/apple-pay/apple-pay-express.jsx** | Mounts Apple Pay; uses ApplePayExpressService for contact/shipping/submit/complete. |
+| **overrides/app/adyen/components/apple-pay/apple-pay-express-service.js** | processAuthorized (basket update); processSubmit → POST payments (order created in backend) → merchantReference → processPaymentCompleted → thank-you. |
+| **overrides/app/adyen/services/payments.js** | Frontend: submitPayment → POST /api/adyen/payments. |
+| **overrides/app/adyen/services/payments-details.js** | Frontend: submitPaymentsDetails → POST /api/adyen/payments/details (body: data, paymentType). |
+| **overrides/app/adyen/services/paypal-order.ts** | Frontend: updatePayPalOrder → POST /api/adyen/paypal/order. |
+| **overrides/app/pages/checkout/partials/payment.jsx** | Renders AdyenPayment (Adyen) or PaystackPayment; step visibility. |
+| **overrides/app/pages/checkout/partials/adyen-payment.jsx** | Wraps AdyenCheckout with gift card; passes handlers to AdyenCheckout. |
+| **overrides/app/pages/cart/partials/cart-express-payment.tsx** | Renders PaypalExpress and ApplePayExpress inside AdyenExpressCheckoutProvider. |
+| **overrides/app/pages/checkout/index.jsx** | Checkout steps; submitOrder: Paystack vs Adyen (paymentRef.handleAdyenSubmit) vs gift-card-only (POST /api/orders). |
+| **overrides/app/utils/navigator.js** | legacyNavigator.navigateToThankYouPage(orderNo) → /checkout/thankyou?orderNo=... |
+
+This should give you a single place to see **why** each flow behaves as it does and **where** in the code each step is implemented. For order ID behaviour, the crucial distinction remains: **PayPal Express = order number first, order created in payment-details; all others (normal + Apple Pay Express) = order created in payments controller before sending reference to Adyen.**
